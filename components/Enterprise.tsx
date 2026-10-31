@@ -1,35 +1,12 @@
 "use client";
 
-import { createContext, useContext, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { createContext, useContext, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { PERMS, PRIORITIES, type Availability, type Category, type DeclineReason, type Level, type Location, type LocationScope, type Mode, type PermMatrix, type Priority, type Role, type Tone, type User, type Workspace } from "@/lib/model";
+import { defaultChain, P } from "@/lib/seed";
+import { openCount } from "@/lib/workflows";
+import { useWorkspace } from "./Workspace";
 
-/* ------------------------------------------------------------------ */
-/* Types                                                               */
-/* ------------------------------------------------------------------ */
-type Tone = "blue" | "green" | "amber" | "red" | "purple" | "teal" | "slate";
-type Availability = "Available" | "On call" | "Unavailable";
-type Mode = "sequential" | "parallel";
-type Priority = "Urgent" | "High" | "Normal" | "Low";
-
-export type Category = { id: string; name: string; responseMins: number; resolveMins: number };
-export type Role = { id: string; name: string; desc: string; kind: "system" | "tier"; locked?: boolean };
-export type User = { id: string; name: string; email: string; roleId: string; skills: string[]; availability: Availability; open: number };
-export type Level = { id: string; to: string[]; mode: Mode; ackMins: number };
-
-const PERMS = [
-  ["view", "View tickets"],
-  ["create", "Create tickets"],
-  ["edit", "Edit tickets"],
-  ["delete", "Delete tickets"],
-  ["reassign", "Reassign tickets"],
-  ["config", "Configure SLA & routing"],
-  ["users", "Manage users"],
-  ["billing", "Licensing & billing"],
-] as const;
-
-type PermMatrix = Record<string, Record<string, boolean>>;
-const PRIORITIES: Priority[] = ["Urgent", "High", "Normal", "Low"];
-
-type License = { plan: string; seats: number; pricePerSeat: number; expires: string };
+export type { Category, Role, User, Level };
 
 type Ctx = {
   categories: Category[]; setCategories: Dispatch<SetStateAction<Category[]>>;
@@ -38,7 +15,10 @@ type Ctx = {
   users: User[]; setUsers: Dispatch<SetStateAction<User[]>>;
   chains: Record<string, Level[]>; setChains: Dispatch<SetStateAction<Record<string, Level[]>>>;
   multipliers: Record<Priority, number>; setMultipliers: Dispatch<SetStateAction<Record<Priority, number>>>;
-  license: License; setSeats: (n: number) => void;
+  /** Read from the Licence Registry entry for this customer, not from the customer's database. */
+  license: { plan: string; seats: number; pricePerSeat: number; expires: string; maxSites: number; modules: string[] }; setSeats: (n: number) => void;
+  declineReasons: DeclineReason[]; setDeclineReasons: Dispatch<SetStateAction<DeclineReason[]>>;
+  locations: Location[];
 };
 
 const EnterpriseCtx = createContext<Ctx | null>(null);
@@ -50,74 +30,30 @@ export function useEnterprise() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Seed data                                                           */
+/* Provider                                                            */
+/* Exposes the *active customer's* configuration. Every setter writes  */
+/* into that customer's workspace only, so customers stay independent. */
 /* ------------------------------------------------------------------ */
-const defaultChain = (): Level[] => [
-  { id: "l1", to: ["t2"], mode: "sequential", ackMins: 30 },
-  { id: "l2", to: ["t1", "regional"], mode: "parallel", ackMins: 15 },
-  { id: "l3", to: ["super"], mode: "sequential", ackMins: 10 },
-];
-
-const seedCategories: Category[] = [
-  { id: "heating", name: "Heating", responseMins: 60, resolveMins: 480 },
-  { id: "plumbing", name: "Plumbing", responseMins: 120, resolveMins: 720 },
-  { id: "electrical", name: "Electrical", responseMins: 60, resolveMins: 480 },
-  { id: "access", name: "Access", responseMins: 30, resolveMins: 240 },
-  { id: "lift", name: "Lift", responseMins: 30, resolveMins: 360 },
-  { id: "noise", name: "Noise", responseMins: 240, resolveMins: 1440 },
-  { id: "safeguarding", name: "Safeguarding", responseMins: 15, resolveMins: 120 },
-];
-
-const seedRoles: Role[] = [
-  { id: "super", name: "Super Admin", desc: "One per enterprise. Configures roles, tiers, categories, SLAs and licensing.", kind: "system", locked: true },
-  { id: "regional", name: "Regional Admin", desc: "Delegated admin for a region or property group. Cannot change licensing.", kind: "system" },
-  { id: "t1", name: "Type 1", desc: "Senior tier. Final escalation point before admins.", kind: "tier" },
-  { id: "t2", name: "Type 2", desc: "Middle tier. First escalation point for assignees.", kind: "tier" },
-  { id: "t3", name: "Type 3", desc: "Front-line tier. Works assigned tickets.", kind: "tier" },
-];
-
-const P = (view: boolean, create: boolean, edit: boolean, del: boolean, reassign: boolean, config: boolean, users: boolean, billing: boolean) =>
-  ({ view, create, edit, delete: del, reassign, config, users, billing });
-
-const seedPerms: PermMatrix = {
-  super: P(true, true, true, true, true, true, true, true),
-  regional: P(true, true, true, true, true, true, true, false),
-  t1: P(true, true, true, false, true, false, false, false),
-  t2: P(true, true, true, false, true, false, false, false),
-  t3: P(true, true, false, false, false, false, false, false),
-};
-
-const seedUsers: User[] = [
-  { id: "u1", name: "Olivia Price", email: "olivia.price@example.com", roleId: "super", skills: [], availability: "Available", open: 0 },
-  { id: "u2", name: "Hannah Reid", email: "hannah.reid@example.com", roleId: "regional", skills: [], availability: "Available", open: 0 },
-  { id: "u3", name: "Ruth Allen", email: "ruth.allen@example.com", roleId: "t1", skills: [], availability: "Available", open: 1 },
-  { id: "u4", name: "James Cole", email: "james.cole@example.com", roleId: "t1", skills: [], availability: "On call", open: 0 },
-  { id: "u5", name: "Priya Shah", email: "priya.shah@example.com", roleId: "t2", skills: ["Access", "Noise", "Safeguarding"], availability: "On call", open: 4 },
-  { id: "u6", name: "Dana Hughes", email: "dana.hughes@example.com", roleId: "t3", skills: ["Heating", "Plumbing", "Electrical"], availability: "Available", open: 6 },
-  { id: "u7", name: "Marcus Lee", email: "marcus.lee@example.com", roleId: "t3", skills: ["Heating", "Electrical", "Access", "Lift"], availability: "Available", open: 8 },
-  { id: "u8", name: "Alex Morgan", email: "alex.morgan@example.com", roleId: "t3", skills: ["Noise", "Safeguarding"], availability: "Unavailable", open: 2 },
-];
-
-const seedChains = (): Record<string, Level[]> => {
-  const out: Record<string, Level[]> = {};
-  seedCategories.forEach((c) => { out[c.id] = defaultChain(); });
-  out.safeguarding = [
-    { id: "l1", to: ["t2", "t1"], mode: "parallel", ackMins: 10 },
-    { id: "l2", to: ["regional", "super"], mode: "parallel", ackMins: 5 },
-  ];
-  return out;
-};
-
 export function EnterpriseProvider({ children }: { children: ReactNode }) {
-  const [categories, setCategories] = useState<Category[]>(seedCategories);
-  const [roles, setRoles] = useState<Role[]>(seedRoles);
-  const [perms, setPerms] = useState<PermMatrix>(seedPerms);
-  const [users, setUsers] = useState<User[]>(seedUsers);
-  const [chains, setChains] = useState<Record<string, Level[]>>(seedChains);
-  const [multipliers, setMultipliers] = useState<Record<Priority, number>>({ Urgent: 0.25, High: 0.5, Normal: 1, Low: 2 });
-  const [license, setLicense] = useState<License>({ plan: "Starter", seats: 10, pricePerSeat: 12, expires: "30 Sep 2027" });
-  const setSeats = (n: number) => setLicense((l) => ({ ...l, seats: n }));
-  return <EnterpriseCtx.Provider value={{ categories, setCategories, roles, setRoles, perms, setPerms, users, setUsers, chains, setChains, multipliers, setMultipliers, license, setSeats }}>{children}</EnterpriseCtx.Provider>;
+  const { ws, entry, updateWorkspace, updateLicence } = useWorkspace();
+  const value = useMemo<Ctx>(() => {
+    const setter = <K extends keyof Workspace>(key: K): Dispatch<SetStateAction<Workspace[K]>> => (u) =>
+      updateWorkspace((w) => ({ ...w, [key]: typeof u === "function" ? (u as (p: Workspace[K]) => Workspace[K])(w[key]) : u }));
+    return {
+      categories: ws.categories, setCategories: setter("categories"),
+      roles: ws.roles, setRoles: setter("roles"),
+      perms: ws.perms, setPerms: setter("perms"),
+      // Workload is derived live from the customer's tickets.
+      users: ws.users.map((u) => ({ ...u, open: openCount(ws, u.id) })), setUsers: setter("users"),
+      chains: ws.chains, setChains: setter("chains"),
+      multipliers: ws.multipliers, setMultipliers: setter("multipliers"),
+      license: { plan: entry?.licence.plan ?? "—", seats: entry?.licence.maxUsers ?? 0, pricePerSeat: entry?.licence.pricePerSeat ?? 0, expires: entry?.licence.validUntil ?? "—", maxSites: entry?.licence.maxSites ?? 0, modules: entry?.licence.modules ?? [] },
+      setSeats: (n) => updateLicence((l) => ({ ...l, maxUsers: n })),
+      declineReasons: ws.declineReasons, setDeclineReasons: setter("declineReasons"),
+      locations: ws.locations,
+    };
+  }, [ws, entry, updateWorkspace, updateLicence]);
+  return <EnterpriseCtx.Provider value={value}>{children}</EnterpriseCtx.Provider>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -172,23 +108,74 @@ export function EntTabs({ tabs, value, onChange }: { tabs: [string, string, stri
 /* ------------------------------------------------------------------ */
 /* Administration                                                      */
 /* ------------------------------------------------------------------ */
-type AdminTab = "roles" | "users" | "categories" | "licensing";
+type AdminTab = "roles" | "users" | "categories" | "declines" | "licensing";
 
 export function AdminPage() {
-  const [tab, setTab] = useState<AdminTab>("roles");
-  const { users, categories, license } = useEnterprise();
+  const { users, categories, license, declineReasons } = useEnterprise();
+  const { can, ws } = useWorkspace();
+  // SIMULATED: tabs follow the signed-in persona's role permissions in this customer.
+  const tabs = ([
+    ["roles", "Roles & permissions", undefined, can("users")],
+    ["users", "Users & skills", `${users.length}/${license.seats}`, can("users")],
+    ["categories", "Categories & skills", String(categories.length), can("config")],
+    ["declines", "Decline reasons", String(declineReasons.filter((r) => r.active).length), can("config")],
+    ["licensing", "Licensing", undefined, can("billing")],
+  ] as [AdminTab, string, string | undefined, boolean][]).filter((t) => t[3]);
+  const [picked, setTab] = useState<AdminTab>("roles");
+  const tab = tabs.some((t) => t[0] === picked) ? picked : tabs[0]?.[0];
+  if (!tab) return <div className="page-content"><Panel><div className="ent-pad"><Note tone="amber"><strong>No administration access.</strong> Your role in {ws.customer.name} has no admin permissions.</Note></div></Panel></div>;
   return <div className="page-content">
-    <EntTabs value={tab} onChange={(v) => setTab(v as AdminTab)} tabs={[
-      ["roles", "Roles & permissions"],
-      ["users", "Users & skills", `${users.length}/${license.seats}`],
-      ["categories", "Categories & skills", String(categories.length)],
-      ["licensing", "Licensing"],
-    ]} />
+    <EntTabs value={tab} onChange={(v) => setTab(v as AdminTab)} tabs={tabs.map(([id, label, count]) => [id, label, count])} />
     {tab === "roles" && <RolesTab />}
     {tab === "users" && <UsersTab />}
     {tab === "categories" && <CategoriesTab />}
+    {tab === "declines" && <DeclineReasonsTab />}
     {tab === "licensing" && <LicensingTab />}
   </div>;
+}
+
+function DeclineReasonsTab() {
+  const { declineReasons, setDeclineReasons } = useEnterprise();
+  const { ws } = useWorkspace();
+  const [val, setVal] = useState("");
+  const [msg, setMsg] = useState<{ tone: Tone; text: string } | null>(null);
+  const used = (id: string) => ws.tickets.filter((t) => t.declines.some((d) => d.reasonId === id)).length;
+  const patch = (id: string, change: Partial<DeclineReason>) => setDeclineReasons((p) => p.map((r) => (r.id === id ? { ...r, ...change } : r)));
+  const add = () => {
+    const n = val.trim();
+    if (!n) return;
+    if (declineReasons.some((r) => r.label.toLowerCase() === n.toLowerCase())) return setMsg({ tone: "red", text: `"${n}" already exists.` });
+    // New reasons go above "Other" so it stays last in the staff dropdown.
+    setDeclineReasons((p) => { const i = p.findIndex((r) => r.id === "other"); const r = { id: `dr-${Date.now()}`, label: n, requiresExplanation: false, active: true }; return i < 0 ? [...p, r] : [...p.slice(0, i), r, ...p.slice(i)]; });
+    setVal("");
+    setMsg({ tone: "green", text: `"${n}" added. Staff in ${ws.customer.name} can select it straight away.` });
+  };
+  const remove = (id: string) => setDeclineReasons((p) => p.filter((r) => r.id !== id));
+  const cols = "2.4fr .9fr .6fr .6fr 70px";
+  return <>
+    <Note tone="blue"><strong>Decline reasons are set per customer.</strong> Staff must pick one when they ask to decline a ticket. Reasons that need an explanation make the text field mandatory. Changes here only apply to {ws.customer.name}.</Note>
+    <Panel className="ent-gap">
+      <PanelHeader title="Decline reasons" subtitle="Shown to staff in the order below" action={<Badge tone="purple">{declineReasons.filter((r) => r.active).length} active</Badge>} />
+      <div className="ent-addbar">
+        <input className="ent-input" value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="New reason, e.g. Requires specialist equipment" aria-label="New decline reason" />
+        <Btn variant="primary" icon="plus" onClick={add}>Add reason</Btn>
+      </div>
+      {msg && <div className="ent-addmsg"><Note tone={msg.tone}>{msg.text}</Note></div>}
+      <div className="ent-rows">
+        <div className="ent-row head" style={{ gridTemplateColumns: cols }}><span>Reason</span><span className="ent-center">Explanation required</span><span className="ent-center">Active</span><span>Used</span><span /></div>
+        {declineReasons.map((r) => {
+          const n = used(r.id);
+          return <div className={`ent-row ${r.active ? "" : "dim"}`} key={r.id} style={{ gridTemplateColumns: cols }}>
+            <span><input className="ent-input" value={r.label} onChange={(e) => patch(r.id, { label: e.target.value })} aria-label="Reason label" /></span>
+            <span className="ent-center"><Toggle on={r.requiresExplanation} onClick={() => patch(r.id, { requiresExplanation: !r.requiresExplanation })} /></span>
+            <span className="ent-center"><Toggle on={r.active} onClick={() => patch(r.id, { active: !r.active })} /></span>
+            <span className="ent-muted">{n ? `${n} ticket${n > 1 ? "s" : ""}` : "—"}</span>
+            <span>{r.id !== "other" && <span className={`text-link ${n ? "disabled-link" : ""}`} role="button" title={n ? "Used in ticket history. Deactivate it instead." : "Remove reason"} onClick={n ? undefined : () => remove(r.id)}>Remove</span>}</span>
+          </div>;
+        })}
+      </div>
+    </Panel>
+  </>;
 }
 
 function RolesTab() {
@@ -196,7 +183,7 @@ function RolesTab() {
   const tierCount = roles.filter((r) => r.kind === "tier").length;
   const addTier = () => {
     const id = `tier-${Date.now()}`;
-    setRoles((p) => [...p, { id, name: `Type ${tierCount + 1}`, desc: "New tier. Rename it and grant permissions below.", kind: "tier" }]);
+    setRoles((p) => [...p, { id, name: `Type ${tierCount + 1}`, desc: "New tier. Rename it and grant permissions below.", kind: "tier", scope: "assigned" }]);
     setPerms((p) => ({ ...p, [id]: P(true, false, false, false, false, false, false, false) }));
   };
   const rename = (id: string, name: string) => setRoles((p) => p.map((r) => (r.id === id ? { ...r, name } : r)));
@@ -206,21 +193,25 @@ function RolesTab() {
     setPerms((p) => { const n = { ...p }; delete n[id]; return n; });
   };
   const toggle = (rid: string, key: string) => setPerms((p) => ({ ...p, [rid]: { ...p[rid], [key]: !p[rid]?.[key] } }));
+  const setScope = (id: string, scope: LocationScope) => setRoles((p) => p.map((r) => (r.id === id ? { ...r, scope } : r)));
   const cols = `1.5fr repeat(${PERMS.length}, 1fr)`;
+  const hcols = "28px 1.1fr 2.1fr 1fr .5fr 70px";
 
   return <>
-    <Note tone="blue"><strong>Roles are generic tiers, not job titles.</strong> The Super Admin (one per enterprise) decides how many tiers exist, what they are called and what each can do. Edit and delete are off until explicitly granted.</Note>
+    <Note tone="blue"><strong>Roles are generic tiers, not job titles.</strong> The Super Admin (one per enterprise) decides how many tiers exist, what they are called and what each can do. Edit and delete are off until explicitly granted. Each customer configures its own tiers, so renaming Type 1 to &ldquo;Site Manager&rdquo; here does not affect other customers.</Note>
+    <div className="ent-gap"><Note tone="amber"><strong>Prototype:</strong> permissions below control which navigation and actions are shown. They are checked in the browser only and are not a security boundary.</Note></div>
     <Panel className="ent-gap">
       <PanelHeader title="Hierarchy" subtitle="Highest authority first. Escalations move up this order." action={<Btn variant="primary" icon="plus" onClick={addTier}>Add tier</Btn>} />
       <div className="ent-rows">
-        <div className="ent-row head" style={{ gridTemplateColumns: "28px 1.1fr 2.4fr .5fr 70px" }}><span>#</span><span>Role name</span><span>Description</span><span>Members</span><span /></div>
+        <div className="ent-row head" style={{ gridTemplateColumns: hcols }}><span>#</span><span>Role name</span><span>Description</span><span>Location access</span><span>Members</span><span /></div>
         {roles.map((r, i) => {
           const members = users.filter((u) => u.roleId === r.id).length;
           const blocked = members > 0 || inChain(r.id);
-          return <div className="ent-row" key={r.id} style={{ gridTemplateColumns: "28px 1.1fr 2.4fr .5fr 70px" }}>
+          return <div className="ent-row" key={r.id} style={{ gridTemplateColumns: hcols }}>
             <span className="ent-level">{i + 1}</span>
             <span>{r.kind === "tier" ? <input className="ent-input" value={r.name} onChange={(e) => rename(r.id, e.target.value)} aria-label="Role name" /> : <strong className="ent-locked-name">{r.locked && <Ico name="lock" size={11} />}{r.name}</strong>}</span>
             <span className="ent-muted">{r.desc}</span>
+            <span>{r.locked ? <Badge tone="purple">All locations</Badge> : <select className="ent-input" value={r.scope ?? "assigned"} onChange={(e) => setScope(r.id, e.target.value as LocationScope)} aria-label="Location access"><option value="assigned">Assigned locations</option><option value="all">All locations</option></select>}</span>
             <span>{r.id === "super" ? <Badge tone="purple">{members} / 1</Badge> : <strong>{members}</strong>}</span>
             <span>{r.kind === "tier" && <span className={`text-link ${blocked ? "disabled-link" : ""}`} title={blocked ? "In use by members or an escalation chain" : "Remove tier"} role="button" onClick={blocked ? undefined : () => remove(r.id)}>Remove</span>}</span>
           </div>;
@@ -241,8 +232,10 @@ function RolesTab() {
 }
 
 function UsersTab() {
-  const { users, setUsers, roles, categories, license } = useEnterprise();
+  const { users, setUsers, roles, categories, license, locations } = useEnterprise();
+  const { me } = useWorkspace();
   const [name, setName] = useState("");
+  const [locs, setLocs] = useState<string[]>([]);
   const [email, setEmail] = useState("");
   const [roleId, setRoleId] = useState("t3");
   const [skills, setSkills] = useState<string[]>([]);
@@ -255,10 +248,13 @@ function UsersTab() {
     if (full) return setMsg({ tone: "red", text: `Seat limit reached (${used}/${license.seats}). Add seats under Licensing to invite more people.` });
     if (!name.trim() || !email.trim()) return setMsg({ tone: "amber", text: "Name and email are required." });
     if (role?.kind === "tier" && skills.length === 0) return setMsg({ tone: "amber", text: "Select at least one skill so tickets can be routed to this person." });
-    setUsers((p) => [...p, { id: `u-${Date.now()}`, name: name.trim(), email: email.trim(), roleId, skills: role?.kind === "tier" ? skills : [], availability: "Available", open: 0 }]);
+    if (role?.scope !== "all" && locs.length === 0) return setMsg({ tone: "amber", text: "Assign at least one location. This role only sees tickets at its assigned locations." });
+    setUsers((p) => [...p, { id: `u-${Date.now()}`, name: name.trim(), email: email.trim(), roleId, skills: role?.kind === "tier" ? skills : [], availability: "Available", open: 0, locationIds: locs }]);
     setMsg({ tone: "green", text: `${name.trim()} invited as ${role?.name}. They now use 1 seat.` });
-    setName(""); setEmail(""); setSkills([]);
+    setName(""); setEmail(""); setSkills([]); setLocs([]);
   };
+  const toggleLoc = (id: string) => setLocs((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
+  const locLabel = (u: User) => roles.find((r) => r.id === u.roleId)?.scope === "all" ? "All locations" : locations.filter((l) => u.locationIds.includes(l.id)).map((l) => l.name).join(", ") || "None";
   const toggleSkill = (s: string) => setSkills((p) => (p.includes(s) ? p.filter((x) => x !== s) : [...p, s]));
   const removeUser = (id: string) => setUsers((p) => p.filter((u) => u.id !== id));
   const avTone = (a: Availability): Tone => (a === "Available" ? "green" : a === "On call" ? "amber" : "slate");
@@ -267,13 +263,14 @@ function UsersTab() {
     <Panel>
       <PanelHeader title="Team members" subtitle={`${used} of ${license.seats} licensed seats in use`} action={<Badge tone={full ? "red" : "blue"}>{full ? "No seats left" : `${license.seats - used} seats free`}</Badge>} />
       <div className="ent-rows">
-        <div className="ent-row head" style={{ gridTemplateColumns: "1.5fr .8fr 2fr .8fr 50px" }}><span>User</span><span>Role</span><span>Skills</span><span>Availability</span><span /></div>
-        {users.map((u) => <div className="ent-row tall" key={u.id} style={{ gridTemplateColumns: "1.5fr .8fr 2fr .8fr 50px" }}>
+        <div className="ent-row head" style={{ gridTemplateColumns: "1.4fr .8fr 1.6fr 1.2fr .8fr 50px" }}><span>User</span><span>Role</span><span>Skills</span><span>Locations</span><span>Availability</span><span /></div>
+        {users.map((u) => <div className="ent-row tall" key={u.id} style={{ gridTemplateColumns: "1.4fr .8fr 1.6fr 1.2fr .8fr 50px" }}>
           <span className="ent-user"><i className="avatar-small">{initials(u.name)}</i><span><strong>{u.name}</strong><small>{u.email}</small></span></span>
           <span><Badge tone={u.roleId === "super" ? "purple" : u.roleId === "regional" ? "blue" : "slate"}>{roleName(roles, u.roleId)}</Badge></span>
           <span className="ent-chips">{u.skills.length ? u.skills.map((s) => <Badge key={s} tone="teal">{s}</Badge>) : <span className="ent-muted">No ticket skills (admin / oversight)</span>}</span>
+          <span className="ent-muted">{locLabel(u)}</span>
           <span><Badge tone={avTone(u.availability)} dot>{u.availability}</Badge></span>
-          <span>{u.roleId !== "super" && <span className="text-link" role="button" onClick={() => removeUser(u.id)}>Remove</span>}</span>
+          <span>{u.roleId !== "super" && u.id !== me?.id && <span className="text-link" role="button" onClick={() => removeUser(u.id)}>Remove</span>}</span>
         </div>)}
       </div>
     </Panel>
@@ -291,6 +288,11 @@ function UsersTab() {
           <span>Skills / specialisms</span>
           <div className="ent-chips">{categories.map((c) => <Chip key={c.id} on={skills.includes(c.name)} onClick={() => toggleSkill(c.name)}>{c.name}</Chip>)}</div>
           <small>Tickets in these categories are prioritised to this person.</small>
+        </div>}
+        {role?.scope !== "all" && <div className="ent-skillpick">
+          <span>Locations</span>
+          <div className="ent-chips">{locations.map((l) => <Chip key={l.id} on={locs.includes(l.id)} onClick={() => toggleLoc(l.id)}>{l.name}</Chip>)}</div>
+          <small>This person only sees tickets, staff and settings for these locations.</small>
         </div>}
         {msg && <Note tone={msg.tone}>{msg.text}</Note>}
         <Btn variant="primary" icon="plus" onClick={invite}>Send invite</Btn>
@@ -339,7 +341,8 @@ function CategoriesTab() {
 }
 
 function LicensingTab() {
-  const { users, license, setSeats } = useEnterprise();
+  const { users, license, setSeats, locations } = useEnterprise();
+  const { licence: lc, ws } = useWorkspace();
   const used = users.length;
   const pct = Math.min(100, Math.round((used / license.seats) * 100));
   const monthly = license.seats * license.pricePerSeat;
@@ -352,13 +355,15 @@ function LicensingTab() {
     <div className="ent-cards">
       <Panel className="ent-card"><small>PLAN</small><strong>{license.plan}</strong><span>Billed per seat · ${license.pricePerSeat}/seat/month <Badge tone="amber">placeholder price</Badge></span></Panel>
       <Panel className="ent-card"><small>SEATS</small><strong>{used} <em>/ {license.seats}</em></strong><div className="ent-bar"><i className={pct >= 100 ? "full" : ""} style={{ width: `${pct}%` }} /></div><span>${monthly}/month at current seat count</span></Panel>
-      <Panel className="ent-card"><small>EXPIRES</small><strong>{license.expires}</strong><span>About 11 months left · 7-day grace period, then read-only</span></Panel>
+      <Panel className="ent-card"><small>EXPIRES</small><strong>{license.expires}</strong><span>{lc.ok ? `${lc.daysLeft} days left` : "Expired · all sites blocked"}</span></Panel>
+      <Panel className="ent-card"><small>SITES</small><strong>{locations.length} <em>/ {license.maxSites}</em></strong><span>Licensed apartment locations</span></Panel>
+      <Panel className="ent-card"><small>MODULES</small><strong className="ent-modules">{license.modules.length}</strong><span className="ent-chips">{license.modules.map((m) => <Badge key={m} tone="teal">{m}</Badge>)}</span></Panel>
     </div>
     <Panel className="ent-gap">
       <PanelHeader title="Seat management" subtitle="Seats are per internal team member using the product" action={<div className="ent-actions"><Btn onClick={() => setSeats(license.seats + 5)}>Add 5 seats</Btn><Btn disabled={license.seats - 5 < used} onClick={() => setSeats(license.seats - 5)}>Remove 5 seats</Btn></div>} />
       <div className="ent-rows">
         <div className="ent-row"><span>Invites are blocked when every seat is taken. Removing a user frees their seat immediately.</span></div>
-        <div className="ent-row"><span>Expired licenses keep all data and become read-only after the grace period. Nothing is deleted.</span></div>
+        <div className="ent-row"><span>The licence lives in the ZongoVita Licence Registry (Customer → Licence, Customer → Database), not in {ws.customer.name}&apos;s database. It is checked on every request; when it expires all of this customer&apos;s sites are blocked. Data is kept.</span></div>
       </div>
     </Panel>
     <Panel className="ent-gap">
@@ -496,12 +501,13 @@ export function EscalationBuilder() {
 /* ------------------------------------------------------------------ */
 /* Skill-based next-available routing                                  */
 /* ------------------------------------------------------------------ */
-export function NextAvailablePanel() {
+/** `locationIds` limits the pool to staff assigned to those locations (the user's scope / selected location). */
+export function NextAvailablePanel({ locationIds }: { locationIds?: string[] }) {
   const { categories, users, setUsers, roles } = useEnterprise();
   const [catId, setCatId] = useState(categories[0].id);
   const cat = categories.find((c) => c.id === catId) ?? categories[0];
   const rank = (a: Availability) => (a === "Available" ? 0 : a === "On call" ? 1 : 2);
-  const pool = users.filter((u) => u.skills.includes(cat.name)).sort((a, b) => rank(a.availability) - rank(b.availability) || a.open - b.open);
+  const pool = users.filter((u) => u.skills.includes(cat.name) && (!locationIds || u.locationIds.some((l) => locationIds.includes(l)))).sort((a, b) => rank(a.availability) - rank(b.availability) || a.open - b.open);
   const eligible = pool.filter((u) => u.availability !== "Unavailable");
   const cycle = (id: string) => setUsers((p) => p.map((u) => (u.id === id ? { ...u, availability: u.availability === "Available" ? "On call" : u.availability === "On call" ? "Unavailable" : "Available" } : u)));
   const tone = (a: Availability): Tone => (a === "Available" ? "green" : a === "On call" ? "amber" : "slate");

@@ -2,5 +2,6 @@ node_modules
 .next
 next-env.d.ts
 .env*
-HelpDesk-CRM/
+*.tsbuildinfo
 .DS_Store
+HelpDesk-CRM/
