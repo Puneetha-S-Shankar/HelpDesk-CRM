@@ -2,6 +2,8 @@
 
 import { useState, type ReactNode } from "react";
 import { EnterpriseProvider, AdminPage, SlaPolicies, EscalationBuilder, NextAvailablePanel, EntTabs } from "./Enterprise";
+import TicketRep from "./TicketRep";
+import Walkthrough from "./Walkthrough";
 
 type Tone = "blue" | "green" | "amber" | "red" | "purple" | "teal" | "slate";
 
@@ -30,6 +32,8 @@ const tickets: Ticket[] = [
 const navItems = [
   ["dashboard", "Dashboard", "grid"],
   ["tickets", "Tickets", "ticket"],
+  ["ticket-rep", "Ticket Rep", "file"],
+  ["walkthrough", "Walkthrough", "spark"],
   ["my-queue", "My Queue", "inbox"],
   ["team-queue", "Team Queue", "users"],
   ["properties", "Properties", "building"],
@@ -385,6 +389,8 @@ function AppShell() {
   const titles: Record<string, [string, string]> = {
     dashboard: ["Operations Dashboard", "Real-time helpdesk performance across all properties"],
     tickets: ["Ticket Queue", "Triage, assign and manage resident issues"],
+    "ticket-rep": ["Ticket Rep", "How HD-24891 moves from the call to resolution"],
+    walkthrough: ["Walkthrough", "Raise an issue and follow it through every role until close"],
     "my-queue": ["My Queue", "Tickets currently assigned to you"],
     "team-queue": ["Team Queue", "Live workload across the operations team"],
     properties: ["Properties", "Property records, units and service performance"],
@@ -402,6 +408,8 @@ function AppShell() {
   if (subPage === "create") content = <CreateTicket onCancel={() => setSubPage("none")} />;
   else if (subPage === "detail") content = <TicketDetail onBack={() => setSubPage("none")} />;
   else if (page === "dashboard") content = <Dashboard />;
+  else if (page === "ticket-rep") content = <TicketRep />;
+  else if (page === "walkthrough") content = <Walkthrough />;
   else if (["tickets","my-queue","team-queue"].includes(page)) content = <Queue onTicket={() => setSubPage("detail")} />;
   else if (page === "routing") content = <Routing />;
   else if (page === "sla") content = <SlaPage />;
@@ -413,7 +421,7 @@ function AppShell() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark"><span /></span><div><strong>PropDesk</strong><small>OPERATIONS CRM</small></div></div>
-      <nav>{navItems.map((item, i) => <div key={item[0]} className={`${page === item[0] && subPage === "none" ? "active" : ""} ${i === 4 || i === 6 || i === 9 ? "nav-separator" : ""}`} role="button" onClick={() => goPage(item[0])}><Icon name={item[2]} /><span>{item[1]}</span>{item[0] === "tickets" && <b>128</b>}{item[0] === "sla" && <b className="alert-count">7</b>}</div>)}</nav>
+      <nav>{navItems.map((item, i) => <div key={item[0]} className={`${page === item[0] && subPage === "none" ? "active" : ""} ${i === 6 || i === 8 || i === 11 ? "nav-separator" : ""}`} role="button" onClick={() => goPage(item[0])}><Icon name={item[2]} /><span>{item[1]}</span>{item[0] === "tickets" && <b>128</b>}{item[0] === "sla" && <b className="alert-count">7</b>}</div>)}</nav>
       <div className="sidebar-footer"><div className="system-status"><i /><span><strong>All systems operational</strong><small>Last checked 1m ago</small></span></div><div className="user-card"><span className="user-avatar">OP</span><span><strong>Olivia Price</strong><small>Super Admin</small></span><Icon name="more" /></div></div>
     </aside>
     <main className="main">
