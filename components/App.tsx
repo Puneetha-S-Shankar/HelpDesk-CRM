@@ -9,11 +9,15 @@ import { WorkspaceProvider, useWorkspace } from "./Workspace";
 import { CreateTicket, TicketDetail, TicketQueue, type QueueTab } from "./Tickets";
 import { LocationsPage } from "./Locations";
 import { availTone, Badge, Button, ConfirmDialog, EmptyState, Icon, Panel, PanelHeader, clock, when } from "./ui";
+import TicketRep from "./TicketRep";
+import Walkthrough from "./Walkthrough";
 
 /** [id, label, icon, nav group] */
 const navItems: [string, string, string, number][] = [
   ["dashboard", "Dashboard", "grid", 0],
   ["tickets", "Tickets", "ticket", 0],
+  ["ticket-rep", "Ticket Rep", "file", 0],
+  ["walkthrough", "Walkthrough", "spark", 0],
   ["my-queue", "My Queue", "inbox", 0],
   ["team-queue", "Team Queue", "users", 0],
   ["properties", "Properties", "building", 1],
@@ -391,6 +395,8 @@ function AppShell() {
   const titles: Record<string, [string, string]> = {
     dashboard: ["Operations Dashboard", `Real-time helpdesk performance across ${locationId === "all" ? "your locations" : locationName(ws, locationId)}`],
     tickets: ["Ticket Queue", "Triage, assign and manage resident issues"],
+    "ticket-rep": ["Ticket Rep", "How HD-24891 moves from the call to resolution"],
+    walkthrough: ["Walkthrough", "Raise an issue and follow it through every role until close"],
     "my-queue": ["My Queue", "Tickets currently assigned to you"],
     "team-queue": ["Team Queue", "Unassigned tickets waiting for pickup"],
     properties: ["Properties & Locations", "Apartment locations, staff assignment and site operations"],
@@ -417,6 +423,8 @@ function AppShell() {
   else if (subPage === "create") content = <CreateTicket onCancel={() => setSubPage("none")} onCreated={openTicket} />;
   else if (subPage === "detail" && ticketId) content = <TicketDetail ticketId={ticketId} onBack={() => setSubPage("none")} />;
   else if (effectivePage === "dashboard") content = <Dashboard onNav={goPage} onTicket={openTicket} />;
+  else if (effectivePage === "ticket-rep") content = <TicketRep />;
+  else if (effectivePage === "walkthrough") content = <Walkthrough />;
   else if (["tickets", "my-queue", "team-queue"].includes(effectivePage)) {
     const tab: QueueTab = queueTab ?? (effectivePage === "my-queue" ? "mine" : effectivePage === "team-queue" ? "unassigned" : "all");
     content = <TicketQueue key={`${effectivePage}-${tab}`} initialTab={tab} onTicket={openTicket} />;
