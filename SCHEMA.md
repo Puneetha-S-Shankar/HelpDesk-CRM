@@ -1,10 +1,10 @@
-# PropDesk Helpdesk CRM: Database Schema (v5, Ravi revision)
+# PropDesk Helpdesk CRM: Database Schema (v7, final closeout)
 
-Full SQL: [schema.sql](schema.sql) · Tests: [schema_tests.sql](schema_tests.sql) · Design: [docs/LLD.md](docs/LLD.md) · Load: [docs/LOAD_TEST.md](docs/LOAD_TEST.md)
+Full SQL: [schema.sql](schema.sql) · Tests: [schema_tests.sql](schema_tests.sql) · Migrations: [migrations/](migrations/) · Design: [docs/LLD.md](docs/LLD.md) · Load: [docs/LOAD_TEST.md](docs/LOAD_TEST.md)
 
-PostgreSQL 16+. Shared database with **row-level security** (`SET LOCAL app.enterprise_id`) plus composite foreign keys on `enterprise_id`. Dedicated database remains a later paid tier (see LLD §1.1 vs IMS).
+PostgreSQL 16+. Shared database with **row-level security** (`SET LOCAL app.enterprise_id`) plus composite foreign keys on `enterprise_id`. Roles: `propdesk_app` / `propdesk_readonly` (UPDATE/DELETE revoked on append-only tables). Dedicated database remains a later paid tier (LLD §1.1).
 
-**Keep:** composite FKs, `ticket_assignments` as Ownership history, immutable published chains, SKIP LOCKED timers + outbox, AI corrections on the prediction row, Heating sample story as acceptance.
+**Final closeout includes:** Ravi Nov 12 §1–§7 SQL priorities, §6 engines wired (severity skip, workload_cap, nobody_free, fan-out, licence, category-tree chains), breach writers, busy restore, AI apply/triage, monthly partitions, DPDPA `anonymise_tenant`.
 
 ## Platform posture
 
@@ -13,84 +13,62 @@ PostgreSQL 16+. Shared database with **row-level security** (`SET LOCAL app.ente
 | Cross-tenant *references* | Composite FKs `(enterprise_id, …)` |
 | Cross-tenant *access* | RLS + `assert_enterprise()`; DEFINER functions pin `search_path` |
 | Session | API sets `SET LOCAL app.enterprise_id` once per transaction |
+| Append-only | Triggers + REVOKE UPDATE/DELETE on `ticket_events` / `audit_log` for `propdesk_app` |
 
 ## 1. Platform and settings
 
 | Table | Notes |
 |---|---|
 | `enterprises` | Licensee company |
-| `licenses` | Plan, seats, price, expiry, grace |
-| `enterprise_settings` | Prefix, auto-close, **reopen_days**, at-risk %, **ai_routing_mode**, confidence threshold, priority raise cap, AI timeout, outbox max attempts |
-| `enterprise_counters` | Ticket numbers |
+| `licenses` | **History rows**; one `is_current`; `assert_licence_active` on create |
+| `enterprise_settings` | Prefix, auto-close, **reopen_window_days**, at-risk %, AI mode/threshold/raise-cap/timeout, outbox max attempts |
+| `enterprise_counters` | Ticket numbers (`next_ticket_number` pads ≥5 digits; race-safe upsert) |
 
 ## 2. Business hours
 
-| Table | Notes |
-|---|---|
-| `business_calendars` | Named calendars + **timezone** (DST-aware SLA math) |
-| `business_hours` | Weekday windows |
-| `calendar_holidays` | Closed days |
+Calendars carry **timezone** (DST-aware). Multiple windows per weekday supported (split shifts). Empty hours → raise; 366-day cap.
 
-## 3. Portfolio
+## 3–5. Portfolio, people, rules
 
-`regions`, `properties`, `units`, `assets`, `tenants`, `leases` — unchanged roles; properties keep timezone + calendar link.
+Unchanged roles. Skills match by **category_id only**. Escalation chains: published + in-use children immutable. Severity rules drive skip / window factor / force 24×7. Levels expose `workload_cap`, `nobody_free`, `mode`.
 
-## 4. People and access
+**SLA source of truth:** `sla_policies` (unique per category); category mins are optional overrides via `COALESCE(cat, pol)`.
 
-| Table | Notes |
-|---|---|
-| `roles` / `role_permissions` | Includes Type 3 keys: `accept`, `decline`, `busy`, `respond`, `resolve` |
-| `users` | Availability, maintained `open_ticket_count`, **busy_until** |
-| `user_absences` | Leave / busy windows |
-| `user_properties` | Property coverage |
-| `user_region_scopes` | Regional Admin region limits |
-| `user_skills` | Match by **category_id only** |
-
-## 5. Rules
-
-`categories`, `sla_policies`, `priority_rules`, `escalation_chains`, `escalation_levels`, `escalation_level_roles`, `escalation_severity_rules`, `routing_rules`, `hold_reasons` (tenant SLA pause + optional **pauses_level_timers**).
-
-Published chains in use cannot be edited in place.
+**Sentiment source of truth:** writable on `ticket_comments` and `ai_predictions`; tenant/ticket sentiment columns are denormalised cache only.
 
 ## 6. Tickets
 
-| Table | Notes |
+| Concern | Behaviour |
 |---|---|
-| `tickets` | Work **status** has no `Escalated`; use `escalation_level` + `escalation_state`; breach timestamps; `needs_triage`; `declined_user_ids` |
-| `ticket_levels` | Per-level clocks |
-| `ticket_assignments` | Ownership handoff history (authoritative for who held the ticket) |
-| `ticket_holds` | Hold windows |
-| `ticket_timers` | `consumed_at` + **`cancelled_at`**; claim/act/consume in one txn; partial index on due open timers |
-| `ticket_comments` | Tenant / reply / internal |
-| `ticket_events` | Operational timeline — **append-only** |
-| `notifications` | User inbox; **created by** outbox notify handlers (outbox is the queue) |
+| Escalation | Fields `escalation_level` + `escalation_state` (`none`/`waiting`/`acked`/`exhausted`); work status unchanged |
+| Create | `create_ticket` → number, `chain_id` (category-tree walk), `ai_enrich` outbox, level 0 + policy |
+| Holds | Cancel/re-arm SLA; business-minute pause; restore `status_before_hold` |
+| Breaches | `respond_breached_at` / `resolve_breached_at` written by `act_and_consume_timer` |
+| Integrity | Trigger: unit.property = ticket.property; lease.unit = ticket.unit |
+| Channel / severity | CHECKed lists |
+
+`ticket_events`, `ticket_timers`, `outbox_events`, `audit_log` are **monthly RANGE partitioned** (plus DEFAULT).
 
 ## 7. AI, outbox, audit
 
-| Table | Notes |
+| Function | Notes |
 |---|---|
-| `ai_predictions` | **routing_mode**, model, **prompt_version**, needs_triage, corrections |
-| `outbox_events` | **dedupe_key**, back-off (`next_attempt_at`), status includes **dead** |
-| `audit_log` | Config changes — **append-only** |
+| `apply_ai_prediction` | Auto threshold / human confirm; raise cap; non-leaf → triage; then policy + route |
+| `ai_enrich_timeout` | Marks triage + `timed_out` |
+| Outbox | dedupe_key, back-off, `locked_until`, `dead` |
+| `anonymise_tenant` | Scrubs PII; appends audit; keeps history |
 
-## 8. Reports and migration
+## 8. Engine (high level)
 
-`report_runs`, `import_jobs`, `import_rows`, view `ticket_facts`.  
-Open imports arm SLA from import time; closed historical imports skip clocks.
+- Timers: `claim_due_timer` → `act_and_consume_timer` (breach / busy restore / ack timeout / auto-close) in one txn
+- Routing: advisory + SKIP LOCKED; workload_cap; nobody_free → unassign / escalate / notify_manager
+- Escalate: severity skip; exhausted at top; ack anti-loop (2m); level fan-out notify
+- `change_ticket_classification`: recompute from now, keep pause totals
 
-## 9. Engine functions (high level)
-
-- Tenancy: `current_enterprise_id`, `assert_enterprise`
-- Timers: `arm_timer`, `clear_open_timers` (cancels), `claim_due_timer`, `consume_timer`
-- Lifecycle: `enter_level`, `assign_level`, `pick_and_assign` (advisory lock + `FOR UPDATE`), `respond_to_ticket`, `decline_assignment`, `mark_assignee_busy(duration)`, holds, `escalate_ticket` / `acknowledge_escalation`, resolve / reopen (window or follow-up) / close
-- Policy/time: `apply_ticket_policy`, `resolve_sla_policy`, `resolve_chain`, business-minute helpers
-
-Worker contract is documented above `ticket_timers` in [schema.sql](schema.sql) and in LLD §6 (5s poll, &lt;30s lag).
-
-## 10. Verification
+## 9. Verification
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema.sql -f schema_tests.sql
 ```
 
-Tests cover: sample story (Dana→Marcus→Unassigned→escalate without changing work status→ack→resolve→close), cross-tenant assert, double timer consume, serialized dual assign, append-only events.
+Tests cover numbering, TZ/DST, holds, dual-assign, exhausted, severity skip, breaches, busy restore, AI triage/raise-cap/non-leaf, licence block, anonymise, partitions, cross-tenant create/escalate, handoff freeze.

@@ -101,7 +101,7 @@ Same table inventory as SCHEMA.md; additions called out in §3 and schema commen
 | Priority | `Urgent`, `High`, `Normal`, `Low` |
 | Availability | `Available`, `On call`, `Unavailable` |
 | **Work status** | `Open`, `In Progress`, `On Hold`, `Unassigned`, `Resolved`, `Closed`, `Cancelled`, `Duplicate` — **no `Escalated`** |
-| Escalation state | `none`, `waiting`, `acked` (on ticket: `escalation_level`, `escalation_state`) |
+| Escalation state | `none`, `waiting`, `acked`, **`exhausted`** (on ticket: `escalation_level`, `escalation_state`) |
 | Assignment reason | `initial_route`, `declined`, `busy`, `reassign`, `escalate_ack`, `import` |
 | AI routing mode | `auto`, `human_review` (enterprise default; copied onto each `ai_predictions` row) |
 | Permission keys | `view`, `create`, `edit`, `delete`, `reassign`, `config`, `users`, `billing`, **`accept`**, **`decline`**, **`busy`**, **`respond`**, **`resolve`** |
@@ -202,7 +202,7 @@ stateDiagram-v2
   InProgress --> Cancelled: cancel
 ```
 
-Escalation is **orthogonal**: `escalation_state` ∈ {none, waiting, acked}, `escalation_level` int. An `In Progress` or `On Hold` ticket keeps its work status when escalated.
+Escalation is **orthogonal**: `escalation_state` ∈ {none, waiting, acked, exhausted}, `escalation_level` int. An `In Progress` or `On Hold` ticket keeps its work status when escalated. Escalating when already at the chain’s max level sets **`exhausted`**, cancels ack timers, notifies once (outbox dedupe), and does **not** re-enter that level.
 
 **Guards**
 
@@ -216,6 +216,10 @@ Escalation is **orthogonal**: `escalation_state` ∈ {none, waiting, acked}, `es
 
 Unchanged chain resolution (`resolve_chain`); published chains immutable when referenced. Level timers + `escalation_ack` worker path. Severity rules may skip levels.
 
+### 4.1 Ticket create
+
+`create_ticket(...)` is the sync path: allocate number, insert ticket, set **`chain_id = resolve_chain(...)`**, optional notes comment, enqueue **`ai_enrich`** (never wait on AI), `enter_level(0)` + `apply_ticket_policy` for open tickets. Closed imports skip clocks.
+
 ### 4.6 SLA clock
 
 ```
@@ -225,10 +229,11 @@ resolve_mins = category.resolve_mins * priority_rules.multiplier
 
 Heating Urgent example: 60×0.25 → **15m** respond; 480×0.25 → **2h** resolve.
 
-- Each **property calendar** has a **timezone**; business-minute helpers convert with DST awareness.
+- Each **property calendar** has a **timezone**; business-minute helpers convert with DST awareness; calendars with **no `business_hours` rows raise**; loops are capped (366 days).
 - Mid-ticket category/priority change: recompute deadlines from **now** with the new policy (elapsed pause totals retained); emit `ticket_events` + audit-style payload.
-- Reopen: new `clock_started_at = now()`; re-apply policy.
-- Holds: by default pause **tenant SLA only**; level timers keep running unless `hold_reasons.pauses_level_timers`.
+- Reopen: always reset `clock_started_at` and `rtat_mins`; Closed uses `reopen_window_days`; after window → follow-up ticket.
+- Holds: `start_hold` stores `status_before_hold` and cancels open tenant/at-risk timers (level timers if `pauses_level_timers`). `end_hold` restores prior status; pause duration uses **business minutes** when a calendar is set, then re-arms policy. Default: pause **tenant SLA only**.
+- `apply_ticket_policy` skips re-arming `tenant_respond` when `first_response_at` is set; arms **resolve at-risk**; missing settings fails loudly.
 - Persist `respond_breached_at`, `resolve_breached_at` (and boolean flags) on the ticket when breaches fire — reporting must not recompute breach history.
 - Open imports: arm SLA from import time. Closed historical imports: no clocks.
 
@@ -241,18 +246,22 @@ All mutating engine functions: `SECURITY DEFINER`, pinned `search_path`, call `a
 | Function | Notes |
 |---|---|
 | `assert_enterprise()` | Session `app.enterprise_id` required |
-| `next_ticket_number` | Counter bump |
-| `resolve_sla_policy` / `resolve_chain` | Rule lookup |
-| `add_business_minutes` / `business_minutes_between` | TZ + DST via calendar timezone |
-| `apply_ticket_policy` | Tenant SLA + timers; open imports OK; closed imports no-op |
-| `enter_level` / `assign_level` / `pick_and_assign` | Pool lock; maintained open counts |
+| `next_ticket_number` | Upsert counter; pad ≥5 digits (no truncation at 100000) |
+| `create_ticket` | Licence check; number + `chain_id` (category-tree walk); `ai_enrich`; level 0 + policy |
+| `resolve_sla_policy` / `resolve_chain` | Policy lookup; chain walks parent categories |
+| `add_business_minutes` / `business_minutes_between` | Calendar TZ + DST; empty hours raise; day cap; split shifts |
+| `apply_ticket_policy` | Tenant SLA + timers; no respond re-arm after first response; resolve at-risk |
+| `change_ticket_classification` | Mid-ticket category/priority; clock from now; keep pause totals |
+| `enter_level` / `assign_level` / `pick_and_assign` | Severity window factor; fan-out; workload_cap; nobody_free; pool lock |
+| `apply_ai_prediction` / `ai_enrich_timeout` | Auto/human modes; raise cap; non-leaf → triage; timeout → triage |
 | `respond_to_ticket` | Requires `accept`/`respond` permission at API layer |
-| `decline_assignment` / `mark_assignee_busy(duration)` | Explicit declined set; busy_until |
-| `start_hold` / `end_hold` | Tenant vs level pause flags |
-| `escalate_ticket` / `acknowledge_escalation` | Escalation fields only; anti-loop |
-| `resolve_ticket` / `reopen_ticket` / `close_ticket` | Reopen window vs follow-up ticket |
-| `claim_due_timer` / `consume_timer` | Same transaction as handler act |
-| `record_event` / `enqueue_outbox` | Append-only events; deduped outbox |
+| `decline_assignment` / `mark_assignee_busy` / `handle_busy_until` | Declined set; busy window; auto Available on timer |
+| `start_hold` / `end_hold` | Cancel/re-arm SLA; business-minute pause; restore `status_before_hold` |
+| `escalate_ticket` / `acknowledge_escalation` | Severity skip; **exhausted** at top; ack anti-loop (2m); clears declined |
+| `resolve_ticket` / `reopen_ticket` / `close_ticket` | `reopen_window_days` vs follow-up; open_ticket_count maintained |
+| `claim_due_timer` / `act_and_consume_timer` | Claim/act/consume one txn; writes breach timestamps |
+| `anonymise_tenant` | DPDPA scrub; retain audit |
+| `record_event` / `enqueue_outbox` | Selective notify; deduped outbox |
 
 ---
 
@@ -310,13 +319,13 @@ Poll every **5s**; target max lag **&lt; 30s**. For a 15-minute respond SLA, wor
 ## 8. AI enrichment
 
 - **Hosting:** frontier model API under DPA; **redact** names, lease numbers, unit ids, phones, emails before send.
-- **Modes** (`enterprise_settings.ai_routing_mode`), copied to `ai_predictions.routing_mode`:
+- **Modes** (`enterprise_settings.ai_routing_mode`), copied to `ai_predictions.routing_mode`; applied via **`apply_ai_prediction`**:
   - **Auto:** confidence ≥ threshold → apply category/priority (within raise cap) → `pick_and_assign`; below → triage.
-  - **Human review:** store suggestions only; coordinator confirms → then policy + route.
+  - **Human review:** store suggestions only; coordinator confirms (`p_confirm := true`) → then policy + route.
 - Store `model_name`, `prompt_version`, confidence, corrections on the row.
 - **Priority raise cap:** AI may raise at most N steps (enterprise setting, default 1) from a baseline; all AI-driven priority changes logged on `ticket_events`.
 - **Non-leaf category:** treat as triage / force human confirm; do not route on non-leaf.
-- Create path never blocks; timeout → triage.
+- Create path never blocks; **`ai_enrich_timeout`** → triage.
 
 ---
 
@@ -332,11 +341,15 @@ Imports: open tickets get SLA from import time; closed historical skip clocks.
 
 ### 9.1 DPDPA erasure
 
-On tenant data request: anonymise/erase PII on `tenants`, comments, notifications; replace names with tokens; **retain** `ticket_events` / `audit_log` with scrubbed payloads so the audit trail remains. Soft delete alone is insufficient.
+On tenant data request call **`anonymise_tenant(enterprise_id, tenant_id)`**: scrub PII on `tenants`, tenant-visible comments, notifications; replace names with tokens; **retain** `ticket_events` / `audit_log` and append an `anonymised` audit row. Soft delete alone is insufficient.
 
 ### 9.2 Volume
 
-Partial indexes: `ticket_timers(fires_at) WHERE consumed_at IS NULL AND cancelled_at IS NULL`; outbox pending by `next_attempt_at`. Time-partition `ticket_events`, `outbox_events`, `audit_log` (monthly) sized for 25k tickets/day.
+Partial indexes: `ticket_timers(fires_at) WHERE consumed_at IS NULL AND cancelled_at IS NULL`; outbox pending by `next_attempt_at`. **`ticket_events`, `outbox_events`, `audit_log`, `ticket_timers`** are monthly RANGE partitions (plus DEFAULT) sized for 25k tickets/day.
+
+### 9.3 Roles
+
+`propdesk_app` may SELECT/INSERT/UPDATE/DELETE on mutable tables; **UPDATE/DELETE revoked** on `ticket_events` and `audit_log` (INSERT+SELECT only). `propdesk_readonly` is SELECT-only.
 
 ---
 
